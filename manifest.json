@@ -1,0 +1,7 @@
+{
+  "name": "UnstablePortalsMetalTransport",
+  "description": "Transport metal through portals by paying a configurable toll, with portal damage and audiovisual instability effects.",
+  "version_number": "1.2.2",
+  "website_url": "",
+  "dependencies": []
+}

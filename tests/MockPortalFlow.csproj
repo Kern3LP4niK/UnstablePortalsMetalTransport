@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="UnstablePortalsMetalTransport">
+      <HintPath>..\bin\Release\net462\UnstablePortalsMetalTransport.dll</HintPath>
+    </Reference>
+    <Reference Include="BepInEx">
+      <HintPath>..\..\vendor\bepinex\BepInExPack_Valheim\BepInEx\core\BepInEx.dll</HintPath>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>..\..\vendor\bepinex\BepInExPack_Valheim\BepInEx\core\0Harmony.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>..\..\vendor\unity-ref\lib\UnityEngine.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>

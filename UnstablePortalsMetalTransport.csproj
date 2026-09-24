@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net462</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>UnstablePortalsMetalTransport</AssemblyName>
+    <RootNamespace>UnstablePortalsMetalTransport</RootNamespace>
+    <Version>1.2.2</Version>
+    <Authors>KernelPanik</Authors>
+    <Company>KernelPanik</Company>
+    <Nullable>disable</Nullable>
+    <Deterministic>true</Deterministic>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <ValheimInstall Condition="'$(VALHEIM_INSTALL)' != ''">$(VALHEIM_INSTALL)</ValheimInstall>
+    <ValheimInstall Condition="'$(ValheimInstall)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Valheim</ValheimInstall>
+    <ValheimManaged>$(ValheimInstall)\valheim_Data\Managed</ValheimManaged>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="src\**\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="BepInEx">
+      <HintPath>$(ValheimInstall)\BepInEx\core\BepInEx.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(ValheimInstall)\BepInEx\core\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>$(ValheimManaged)\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>
