@@ -9,6 +9,8 @@ A client-side Valheim mod for BepInEx that lets players transport metal and othe
 - The toll is consumed only after Valheim accepts the teleport.
 - The price is per trip, not per stack, item, or unit of metal.
 - By default, the source and destination portals each take damage equal to 10% of their maximum health. They can be repaired normally.
+- Optional player damage can combine a percentage of maximum HP, a percentage of current HP, and a flat HP amount. All three default to `0`, so updating does not damage players unless configured.
+- An optional source-portal safety setting can reject the trip before payment when that trip's damage would destroy the entry portal. It is disabled by default and deliberately does not inspect or protect the destination portal, which may not be loaded before travel.
 - When the toll is available, the portal's existing particle animation and light slowly pulse from dark orange to purple and back. By default, the glowing frame runes pulse in the opposite phase, suggesting unstable energy moving between the portal and its frame. No custom model or animation is added.
 - The portal's existing sound also wobbles at a slightly deeper pitch while that instability effect is active. This uses the built-in audio source; no sound file is added.
 - Ordinary items flagged by Valheim as non-teleportable count. This includes metals and ores. Items marked by Valheim as absolutely blocked remain blocked.
@@ -41,13 +43,17 @@ The available settings are:
 | Portal Damage | `DamagePercent` | `10` | Percent of maximum portal health removed from each enabled side. |
 | Portal Damage | `DamageSourcePortal` | `true` | Damage the portal the player enters. |
 | Portal Damage | `DamageDestinationPortal` | `true` | Damage the linked portal the player arrives at. |
+| Portal Damage | `PreventSourcePortalDestruction` | `false` | Reject a restricted-item trip before payment if its configured damage would destroy the source portal. The destination is not checked. |
+| Player Damage | `MaxHealthPercent` | `0` | Damage the player by this percentage of maximum HP after a successful paid trip. |
+| Player Damage | `CurrentHealthPercent` | `0` | Damage the player by this percentage of current HP after a successful paid trip. |
+| Player Damage | `FlatDamage` | `0` | Add this many points of flat player damage after a successful paid trip. |
 | Visuals | `InverseRunePulse` | `true` | Pulse the glowing frame runes opposite the portal particles and light. Set to `false` to synchronize them. |
 | Visuals | `RuneBrightnessMultiplier` | `3` | HDR brightness of the pulsing frame runes. Increase if they appear dim; decrease if bloom is excessive. |
 | Audio | `EnableUnstableSound` | `true` | Pitch-wobble the existing portal sound during the toll effect. |
 | Audio | `MinimumPitchMultiplier` | `0.82` | Deeper endpoint of the pitch wobble. Values below `1` lower the pitch. |
 | Audio | `MaximumPitchMultiplier` | `0.96` | Upper endpoint of the pitch wobble. Values above `1` raise the pitch. |
 
-Set either item cost or the damage percentage to `0` to disable that part. Set either portal-damage toggle to `false` to protect that side. In multiplayer, use the same configuration on every player's client for consistent tolls.
+Set either item cost or a damage value to `0` to disable that component. Set either portal-damage toggle to `false` to protect that side. Player-damage components are calculated from the same pre-damage health snapshot and added together, then passed through Valheim's normal damage method; combined settings can be lethal. In multiplayer, use the same configuration on every player's client for consistent tolls and damage.
 
 For a higher, more strained sound, try `MinimumPitchMultiplier = 1.04` and `MaximumPitchMultiplier = 1.18`. Set both pitch values to the same number for a steady pitch shift instead of a wobble.
 
@@ -77,7 +83,11 @@ The output DLL is written to `bin\Release\net462\UnstablePortalsMetalTransport.d
 
 The mod uses BepInEx and Harmony but does not require Jötunn. It resolves Valheim gameplay types at runtime so moving those types between game assemblies does not by itself break the mod. Other mods that completely replace portal logic may conflict.
 
-Version 1.2.2 targets Valheim 1.0.14's current portal flow. Keep a normal world/character backup before testing any new mod.
+Version 1.3.0 targets Valheim 1.0.14's current portal flow. The per-frame animation loop tracks only portals currently using the toll effect, and disabled unstable audio leaves portal pitch available to other mods. Keep a normal world/character backup before testing any new mod.
+
+## Feedback and source
+
+Source code, issue reports, and feedback are available on [GitHub](https://github.com/Kern3LP4niK/UnstablePortalsMetalTransport).
 
 ## Uninstall
 

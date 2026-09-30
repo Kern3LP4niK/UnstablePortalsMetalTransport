@@ -1,7 +1,10 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Reflection;
+using BepInEx.Configuration;
 using BepInEx.Logging;
 
 public sealed class SharedData
@@ -56,6 +59,8 @@ public sealed class Player : Humanoid
     public static Player m_localPlayer;
     public bool TeleportStarted { get; private set; }
     public bool RejectTeleport { get; set; }
+    public float CurrentHealth { get; set; } = 100f;
+    public float MaximumHealth { get; set; } = 100f;
     public readonly List<string> Messages = new List<string>();
 
     public bool TeleportTo(int position, int rotation, bool distantTeleport)
@@ -69,6 +74,10 @@ public sealed class Player : Humanoid
     {
         Messages.Add(text);
     }
+
+    public float GetHealth() { return CurrentHealth; }
+    public float GetMaxHealth() { return MaximumHealth; }
+    public void Damage(HitData hit) { CurrentHealth -= hit.m_damage.m_damage; }
 }
 
 public struct MockColor
@@ -118,7 +127,18 @@ public sealed class MockLight
 
 public sealed class MockAudioSource
 {
-    public float pitch { get; set; } = 1f;
+    private float _pitch = 1f;
+    public int PitchWriteCount { get; private set; }
+
+    public float pitch
+    {
+        get { return _pitch; }
+        set
+        {
+            _pitch = value;
+            PitchWriteCount++;
+        }
+    }
 }
 
 public sealed class MockEffectFade
@@ -163,6 +183,8 @@ public sealed class WearNTear
     public float m_health = 100f;
     public float CurrentHealth = 100f;
 
+    public float GetHealth() { return CurrentHealth; }
+
     public void Damage(HitData hit)
     {
         CurrentHealth -= hit.m_damage.m_damage;
@@ -204,6 +226,8 @@ public sealed class TeleportWorld
     public MockEffectFade m_target_found;
     public WearNTear Wear = new WearNTear();
     public MockAudioSource Audio = new MockAudioSource();
+    public bool IncludeAudio = true;
+    public int AudioLookupCount;
     public MockZNetView m_nview;
 
     public TeleportWorld()
@@ -218,7 +242,8 @@ public sealed class TeleportWorld
 
     public object[] GetComponentsInChildren(Type componentType, bool includeInactive)
     {
-        return componentType == typeof(MockAudioSource)
+        AudioLookupCount++;
+        return componentType == typeof(MockAudioSource) && IncludeAudio
             ? new object[] { Audio }
             : new object[0];
     }
@@ -287,6 +312,37 @@ internal static class MockPortalFlow
         PortalPostfix.Invoke(null, new object[] { portalArguments });
     }
 
+    private static void UpdatePortalEligibility(TeleportWorld portal, Player player)
+    {
+        Player.m_localPlayer = player;
+        PortalUpdatePrefix.Invoke(null, new object[] { portal });
+        PatchedIsTeleportable(player, portal.m_allowAllItems);
+        PortalUpdatePostfix.Invoke(null, new object[] { portal });
+    }
+
+    private static void SetConfig<T>(
+        string propertyName,
+        string section,
+        string key,
+        T value)
+    {
+        string path = Path.Combine(
+            Path.GetTempPath(),
+            "UnstablePortalsMetalTransport.Tests." + Guid.NewGuid().ToString("N") + ".cfg");
+        ConfigFile config = new ConfigFile(path, false);
+        ConfigEntry<T> entry = config.Bind(section, key, value);
+        PropertyInfo property = typeof(
+            UnstablePortalsMetalTransport.UnstablePortalsMetalTransportPlugin).GetProperty(
+                propertyName,
+                BindingFlags.Static | BindingFlags.NonPublic);
+        property.SetValue(null, entry, null);
+    }
+
+    private static void SetUnstableSoundConfig(bool enabled)
+    {
+        SetConfig("EnableUnstableSound", "Audio", "EnableUnstableSound", enabled);
+    }
+
     public static int Main()
     {
         Patches = typeof(UnstablePortalsMetalTransport.UnstablePortalsMetalTransportPlugin).Assembly
@@ -345,6 +401,12 @@ internal static class MockPortalFlow
             "Metal plus a Core should activate the portal's normal effect.");
         PortalUpdatePostfix.Invoke(null, new object[] { purplePortal });
 
+        IList activeVisualPortals = (IList)Patches
+            .GetField("ActiveVisualPortals", flags)
+            .GetValue(null);
+        Assert(activeVisualPortals.Count == 1,
+            "Only the active toll portal should enter the per-frame animation list.");
+
         object visualStates = Patches.GetField("PortalVisualStates", flags).GetValue(null);
         MethodInfo tryGetVisualState = visualStates.GetType().GetMethod("TryGetValue");
         object[] visualStateArguments = { purplePortal, null };
@@ -392,6 +454,72 @@ internal static class MockPortalFlow
         Assert(destinationPortal.Wear.CurrentHealth == 90f,
             "A paid trip should damage the linked destination portal after it loads.");
 
+        SetConfig("PlayerDamageMaxHealthPercent", "Player Damage", "MaxHealthPercent", 10f);
+        SetConfig("PlayerDamageCurrentHealthPercent", "Player Damage", "CurrentHealthPercent", 20f);
+        SetConfig("PlayerDamageFlat", "Player Damage", "FlatDamage", 5f);
+        Player damagedPlayer = new Player { MaximumHealth = 200f, CurrentHealth = 150f };
+        damagedPlayer.GetInventory().Add(Item("Copper", false, 1));
+        damagedPlayer.GetInventory().Add(Item("SurtlingCore", true, 1));
+        damagedPlayer.GetInventory().Add(Item("GreydwarfEye", true, 5));
+        Travel(new TeleportWorld(), damagedPlayer);
+        Assert(Math.Abs(damagedPlayer.CurrentHealth - 95f) < 0.001f,
+            "Player damage should add 10% maximum HP, 20% pre-hit current HP, and 5 flat HP.");
+
+        Player freePlayer = new Player { MaximumHealth = 200f, CurrentHealth = 150f };
+        freePlayer.GetInventory().Add(Item("Wood", true, 1));
+        Travel(new TeleportWorld(), freePlayer);
+        Assert(Math.Abs(freePlayer.CurrentHealth - 150f) < 0.001f,
+            "Ordinary portal travel must not damage the player.");
+        SetConfig("PlayerDamageMaxHealthPercent", "Player Damage", "MaxHealthPercent", 0f);
+        SetConfig("PlayerDamageCurrentHealthPercent", "Player Damage", "CurrentHealthPercent", 0f);
+        SetConfig("PlayerDamageFlat", "Player Damage", "FlatDamage", 0f);
+
+        SetConfig(
+            "PreventSourcePortalDestruction",
+            "Portal Damage",
+            "PreventSourcePortalDestruction",
+            true);
+        Player protectedTripPlayer = new Player();
+        protectedTripPlayer.GetInventory().Add(Item("Iron", false, 1));
+        protectedTripPlayer.GetInventory().Add(Item("SurtlingCore", true, 1));
+        protectedTripPlayer.GetInventory().Add(Item("GreydwarfEye", true, 5));
+        TeleportWorld fragileSourcePortal = new TeleportWorld();
+        fragileSourcePortal.Wear.CurrentHealth = 10f;
+        Travel(fragileSourcePortal, protectedTripPlayer);
+        Assert(!protectedTripPlayer.TeleportStarted,
+            "Source-portal protection should block a trip whose damage would destroy the source.");
+        Assert(Count(protectedTripPlayer, "SurtlingCore") == 1 &&
+               Count(protectedTripPlayer, "GreydwarfEye") == 5,
+            "A source-protection block must not consume the toll.");
+        Assert(Math.Abs(fragileSourcePortal.Wear.CurrentHealth - 10f) < 0.001f,
+            "A source-protection block must not damage the source portal.");
+        Assert(protectedTripPlayer.Messages.Any(message => message.Contains("would destroy this portal")),
+            "A source-protection block should explain why travel was rejected.");
+
+        Player destinationNotProtectedPlayer = new Player();
+        destinationNotProtectedPlayer.GetInventory().Add(Item("Tin", false, 1));
+        destinationNotProtectedPlayer.GetInventory().Add(Item("SurtlingCore", true, 1));
+        destinationNotProtectedPlayer.GetInventory().Add(Item("GreydwarfEye", true, 5));
+        TeleportWorld safeSourcePortal = new TeleportWorld();
+        TeleportWorld fragileDestinationPortal = new TeleportWorld();
+        fragileDestinationPortal.Wear.CurrentHealth = 10f;
+        ZNetScene.instance.Destination = fragileDestinationPortal;
+        safeSourcePortal.m_nview = new MockZNetView
+        {
+            Zdo = new MockZdo { DestinationId = "destination" }
+        };
+        Travel(safeSourcePortal, destinationNotProtectedPlayer);
+        Assert(destinationNotProtectedPlayer.TeleportStarted,
+            "Source-only protection must not reject travel based on destination health.");
+        UpdatePendingPortalDamage.Invoke(null, null);
+        Assert(Math.Abs(fragileDestinationPortal.Wear.CurrentHealth) < 0.001f,
+            "Destination damage should remain unchanged when source-only protection is enabled.");
+        SetConfig(
+            "PreventSourcePortalDestruction",
+            "Portal Damage",
+            "PreventSourcePortalDestruction",
+            false);
+
         Player normalVisualPlayer = new Player();
         normalVisualPlayer.GetInventory().Add(Item("Wood", true, 1));
         Player.m_localPlayer = normalVisualPlayer;
@@ -404,6 +532,69 @@ internal static class MockPortalFlow
             "The portal's original color should be restored outside the toll case.");
         Assert(Math.Abs(purplePortal.Audio.pitch - 1f) < 0.001f,
             "The portal's original audio pitch should be restored outside the toll case.");
+        Assert(activeVisualPortals.Count == 0,
+            "An inactive portal should be removed from the per-frame animation list.");
+        purplePortal.m_colorTargetfound = new MockColor(0.2f, 0.3f, 0.4f, 1f);
+        UpdatePortalVisuals.Invoke(null, null);
+        Assert(Math.Abs(purplePortal.m_colorTargetfound.R - 0.2f) < 0.001f &&
+               Math.Abs(purplePortal.m_colorTargetfound.G - 0.3f) < 0.001f &&
+               Math.Abs(purplePortal.m_colorTargetfound.B - 0.4f) < 0.001f,
+            "Inactive portals must not be processed by the animation loop.");
+
+        Player lateAudioPlayer = new Player();
+        lateAudioPlayer.GetInventory().Add(Item("Copper", false, 1));
+        lateAudioPlayer.GetInventory().Add(Item("SurtlingCore", true, 1));
+        lateAudioPlayer.GetInventory().Add(Item("GreydwarfEye", true, 5));
+        TeleportWorld lateAudioPortal = new TeleportWorld { IncludeAudio = false };
+        UpdatePortalEligibility(lateAudioPortal, lateAudioPlayer);
+        object[] lateStateArguments = { lateAudioPortal, null };
+        Assert((bool)tryGetVisualState.Invoke(visualStates, lateStateArguments),
+            "The late-audio portal should have a captured visual state.");
+        object lateAudioState = lateStateArguments[1];
+        Assert((bool)lateAudioState.GetType().GetField("DiagnosticsLogged").GetValue(lateAudioState),
+            "Missing-component diagnostics should be recorded once per portal.");
+        Assert((bool)lateAudioState.GetType().GetField("AudioMissingDiagnosticLogged")
+                .GetValue(lateAudioState),
+            "A missing audio source should be included in compatibility diagnostics.");
+        Assert(lateAudioPortal.AudioLookupCount == 1,
+            "Initial portal capture should perform one audio lookup.");
+        lateAudioPortal.IncludeAudio = true;
+        lateAudioState.GetType().GetField("NextAudioCaptureUtc")
+            .SetValue(lateAudioState, DateTime.MinValue);
+        UpdatePortalVisuals.Invoke(null, null);
+        Assert(lateAudioPortal.AudioLookupCount >= 2,
+            "An active portal should retry audio discovery when its source appears late.");
+        Assert(Math.Abs(lateAudioPortal.Audio.pitch - 1f) > 0.001f,
+            "A late-created audio source should receive the instability pitch effect.");
+        UpdatePortalEligibility(lateAudioPortal, normalVisualPlayer);
+
+        Player disabledAudioPlayer = new Player();
+        disabledAudioPlayer.GetInventory().Add(Item("Tin", false, 1));
+        disabledAudioPlayer.GetInventory().Add(Item("SurtlingCore", true, 1));
+        disabledAudioPlayer.GetInventory().Add(Item("GreydwarfEye", true, 5));
+        TeleportWorld disabledAudioPortal = new TeleportWorld();
+        UpdatePortalEligibility(disabledAudioPortal, disabledAudioPlayer);
+        Assert(Math.Abs(disabledAudioPortal.Audio.pitch - 1f) > 0.001f,
+            "Enabled unstable audio should alter the portal pitch.");
+        SetUnstableSoundConfig(false);
+        UpdatePortalVisuals.Invoke(null, null);
+        Assert(Math.Abs(disabledAudioPortal.Audio.pitch - 1f) < 0.001f,
+            "Disabling unstable audio should restore the original pitch once.");
+        disabledAudioPortal.Audio.pitch = 1.23f;
+        int externalPitchWriteCount = disabledAudioPortal.Audio.PitchWriteCount;
+        UpdatePortalVisuals.Invoke(null, null);
+        Assert(Math.Abs(disabledAudioPortal.Audio.pitch - 1.23f) < 0.001f &&
+               disabledAudioPortal.Audio.PitchWriteCount == externalPitchWriteCount,
+            "Disabled unstable audio must leave another mod's pitch value untouched.");
+        SetUnstableSoundConfig(true);
+        UpdatePortalEligibility(disabledAudioPortal, normalVisualPlayer);
+
+        activeVisualPortals.Add(new WeakReference(null));
+        Assert(activeVisualPortals.Count == 1,
+            "The destroyed-portal test should add one dead active reference.");
+        UpdatePortalVisuals.Invoke(null, null);
+        Assert(activeVisualPortals.Count == 0,
+            "Destroyed portals should be removed safely from the animation loop.");
 
         Player lastCore = new Player();
         lastCore.GetInventory().Add(Item("SilverOre", false, 1));

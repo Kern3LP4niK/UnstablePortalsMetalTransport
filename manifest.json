@@ -1,7 +1,7 @@
 {
   "name": "UnstablePortalsMetalTransport",
-  "description": "Transport metal through portals by paying a configurable toll, with portal damage and audiovisual instability effects.",
-  "version_number": "1.2.2",
-  "website_url": "",
+  "description": "Transport metal through portals for a configurable toll, with optional player damage, portal damage, and audiovisual instability.",
+  "version_number": "1.3.0",
+  "website_url": "https://github.com/Kern3LP4niK/UnstablePortalsMetalTransport",
   "dependencies": []
 }

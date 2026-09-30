@@ -16,7 +16,7 @@ namespace UnstablePortalsMetalTransport
     {
         public const string PluginGuid = "com.kernelpanik.unstableportalsmetaltransport";
         public const string PluginName = "Unstable Portals: Metal Transport";
-        public const string PluginVersion = "1.2.2";
+        public const string PluginVersion = "1.3.0";
 
         private Harmony _harmony;
 
@@ -25,6 +25,10 @@ namespace UnstablePortalsMetalTransport
         internal static ConfigEntry<float> PortalDamagePercent { get; private set; }
         internal static ConfigEntry<bool> DamageSourcePortal { get; private set; }
         internal static ConfigEntry<bool> DamageDestinationPortal { get; private set; }
+        internal static ConfigEntry<bool> PreventSourcePortalDestruction { get; private set; }
+        internal static ConfigEntry<float> PlayerDamageMaxHealthPercent { get; private set; }
+        internal static ConfigEntry<float> PlayerDamageCurrentHealthPercent { get; private set; }
+        internal static ConfigEntry<float> PlayerDamageFlat { get; private set; }
         internal static ConfigEntry<bool> InverseRunePulse { get; private set; }
         internal static ConfigEntry<float> RuneBrightnessMultiplier { get; private set; }
         internal static ConfigEntry<bool> EnableUnstableSound { get; private set; }
@@ -64,6 +68,32 @@ namespace UnstablePortalsMetalTransport
                 "DamageDestinationPortal",
                 true,
                 "Damage the linked destination portal after a successful paid trip.");
+            PreventSourcePortalDestruction = Config.Bind(
+                "Portal Damage",
+                "PreventSourcePortalDestruction",
+                false,
+                "Block restricted-item travel before payment when the configured damage would destroy the source portal. This does not inspect or protect the destination portal.");
+            PlayerDamageMaxHealthPercent = Config.Bind(
+                "Player Damage",
+                "MaxHealthPercent",
+                0f,
+                new ConfigDescription(
+                    "Damage the player by this percentage of maximum health after a successful paid trip.",
+                    new AcceptableValueRange<float>(0f, 100f)));
+            PlayerDamageCurrentHealthPercent = Config.Bind(
+                "Player Damage",
+                "CurrentHealthPercent",
+                0f,
+                new ConfigDescription(
+                    "Damage the player by this percentage of current health after a successful paid trip. All player-damage components use the same pre-damage health snapshot and are added together.",
+                    new AcceptableValueRange<float>(0f, 100f)));
+            PlayerDamageFlat = Config.Bind(
+                "Player Damage",
+                "FlatDamage",
+                0f,
+                new ConfigDescription(
+                    "Flat player damage added after the percentage-based damage for a successful paid trip.",
+                    new AcceptableValueRange<float>(0f, 10000f)));
             InverseRunePulse = Config.Bind(
                 "Visuals",
                 "InverseRunePulse",
@@ -131,11 +161,12 @@ namespace UnstablePortalsMetalTransport
         private const string EyePrefabName = "GreydwarfEye";
         private static readonly TimeSpan PendingTripLifetime = TimeSpan.FromSeconds(3);
         private static readonly TimeSpan PendingDamageLifetime = TimeSpan.FromSeconds(20);
+        private static readonly TimeSpan AudioCaptureRetryInterval = TimeSpan.FromSeconds(1);
         private static readonly ConditionalWeakTable<object, PendingTrip> PendingTrips =
             new ConditionalWeakTable<object, PendingTrip>();
         private static readonly ConditionalWeakTable<object, PortalVisualState> PortalVisualStates =
             new ConditionalWeakTable<object, PortalVisualState>();
-        private static readonly List<WeakReference> VisualPortals = new List<WeakReference>();
+        private static readonly List<WeakReference> ActiveVisualPortals = new List<WeakReference>();
         private static readonly List<PendingPortalDamage> PendingDestinationDamage =
             new List<PendingPortalDamage>();
 
@@ -152,6 +183,9 @@ namespace UnstablePortalsMetalTransport
 
         [ThreadStatic]
         private static bool _portalUpdateUsesToll;
+
+        [ThreadStatic]
+        private static bool _sourcePortalTravelBlocked;
 
         private sealed class PendingTrip
         {
@@ -204,6 +238,12 @@ namespace UnstablePortalsMetalTransport
             public object OriginalLightColor;
             public readonly List<ParticleVisualState> Particles = new List<ParticleVisualState>();
             public readonly List<AudioVisualState> AudioSources = new List<AudioVisualState>();
+            public DateTime NextAudioCaptureUtc;
+            public bool AudioPitchModified;
+            public bool ListedAsActive;
+            public bool DiagnosticsLogged;
+            public bool AudioMissingDiagnosticLogged;
+            public bool AudioRecoveryLogged;
             public bool TollEffectActive;
         }
 
@@ -297,6 +337,7 @@ namespace UnstablePortalsMetalTransport
 
         private static void PortalTeleportPrefix(object __instance, object[] __args)
         {
+            _sourcePortalTravelBlocked = false;
             object player = FindPlayer(__args);
             if (player == null || !IsLocalPlayer(player))
             {
@@ -322,6 +363,14 @@ namespace UnstablePortalsMetalTransport
                 return;
             }
 
+            if (WouldDestroySourcePortal(__instance))
+            {
+                _sourcePortalTravelBlocked = true;
+                ShowCenterMessage(player,
+                    "Travel blocked: the instability would destroy this portal.");
+                return;
+            }
+
             SetPendingTrip(
                 player,
                 snapshot.Inventory,
@@ -331,12 +380,19 @@ namespace UnstablePortalsMetalTransport
 
         private static void PortalTeleportPostfix(object[] __args)
         {
-            object player = FindPlayer(__args);
-            if (player != null && HasPendingTrip(player))
+            try
             {
-                // A successful Player.TeleportTo postfix removes the trip first. If it is
-                // still present here, Valheim rejected or did not start the teleport.
-                RemovePendingTrip(player);
+                object player = FindPlayer(__args);
+                if (player != null && HasPendingTrip(player))
+                {
+                    // A successful Player.TeleportTo postfix removes the trip first. If it is
+                    // still present here, Valheim rejected or did not start the teleport.
+                    RemovePendingTrip(player);
+                }
+            }
+            finally
+            {
+                _sourcePortalTravelBlocked = false;
             }
         }
 
@@ -367,24 +423,29 @@ namespace UnstablePortalsMetalTransport
 
         internal static void UpdatePortalVisuals()
         {
-            if (VisualPortals.Count == 0)
+            if (ActiveVisualPortals.Count == 0)
             {
                 return;
             }
 
             float purpleBlend = GetPulseBlend(DateTime.UtcNow);
-            for (int index = VisualPortals.Count - 1; index >= 0; index--)
+            for (int index = ActiveVisualPortals.Count - 1; index >= 0; index--)
             {
-                object portal = VisualPortals[index].Target;
+                object portal = ActiveVisualPortals[index].Target;
                 if (portal == null)
                 {
-                    VisualPortals.RemoveAt(index);
+                    ActiveVisualPortals.RemoveAt(index);
                     continue;
                 }
 
                 PortalVisualState state;
                 if (!PortalVisualStates.TryGetValue(portal, out state) || !state.TollEffectActive)
                 {
+                    if (state != null)
+                    {
+                        state.ListedAsActive = false;
+                    }
+                    ActiveVisualPortals.RemoveAt(index);
                     continue;
                 }
 
@@ -396,7 +457,9 @@ namespace UnstablePortalsMetalTransport
                 {
                     // A destroyed Unity object can leave a live managed wrapper briefly.
                     _log.LogDebug("Stopped animating a portal visual: " + exception.Message);
-                    VisualPortals.RemoveAt(index);
+                    state.TollEffectActive = false;
+                    state.ListedAsActive = false;
+                    ActiveVisualPortals.RemoveAt(index);
                 }
             }
         }
@@ -412,6 +475,12 @@ namespace UnstablePortalsMetalTransport
             InventorySnapshot snapshot = ReadInventory(__instance);
             if (snapshot == null || !snapshot.HasEligibleRestrictedItem ||
                 snapshot.HasAbsoluteRestriction || !HasRequiredToll(snapshot))
+            {
+                return;
+            }
+
+            if (_sourcePortalTravelBlocked ||
+                (_portalBeingUpdated != null && WouldDestroySourcePortal(_portalBeingUpdated)))
             {
                 return;
             }
@@ -469,6 +538,7 @@ namespace UnstablePortalsMetalTransport
                 ShowCenterMessage(__instance, "The portal consumes " + toll + ".");
             }
             _log.LogInfo("Charged " + toll + " for restricted-item portal travel.");
+            ApplyPlayerDamage(__instance);
         }
 
         private static object FindPlayer(object[] arguments)
@@ -499,27 +569,56 @@ namespace UnstablePortalsMetalTransport
             PortalVisualState state;
             if (!PortalVisualStates.TryGetValue(portal, out state))
             {
+                if (!active)
+                {
+                    return;
+                }
                 state = CapturePortalVisualState(portal);
                 PortalVisualStates.Add(portal, state);
-                VisualPortals.Add(new WeakReference(portal));
             }
 
             if (state.TollEffectActive == active)
             {
                 return;
             }
-            if (active && state.ColorConstructor == null)
-            {
-                return;
-            }
-
             state.TollEffectActive = active;
             if (active)
             {
+                AddActivePortal(portal, state);
                 ApplyPortalPulseFrame(portal, state, GetPulseBlend(DateTime.UtcNow));
                 return;
             }
 
+            RemoveActivePortal(portal, state);
+            RestorePortalState(portal, state);
+        }
+
+        private static void AddActivePortal(object portal, PortalVisualState state)
+        {
+            if (state.ListedAsActive)
+            {
+                return;
+            }
+
+            state.ListedAsActive = true;
+            ActiveVisualPortals.Add(new WeakReference(portal));
+        }
+
+        private static void RemoveActivePortal(object portal, PortalVisualState state)
+        {
+            state.ListedAsActive = false;
+            for (int index = ActiveVisualPortals.Count - 1; index >= 0; index--)
+            {
+                object candidate = ActiveVisualPortals[index].Target;
+                if (candidate == null || ReferenceEquals(candidate, portal))
+                {
+                    ActiveVisualPortals.RemoveAt(index);
+                }
+            }
+        }
+
+        private static void RestorePortalState(object portal, PortalVisualState state)
+        {
             if (state.TargetColorField != null && state.OriginalTargetColor != null)
             {
                 state.TargetColorField.SetValue(portal, state.OriginalTargetColor);
@@ -544,66 +643,98 @@ namespace UnstablePortalsMetalTransport
             PortalVisualState state,
             float purpleBlend)
         {
-            if (state.ColorConstructor == null)
+            if (state.ColorConstructor != null)
             {
-                return;
+                object portalColor = CreateBlendedPulseColor(state, purpleBlend);
+                float runeBlend = ConfiguredInverseRunePulse ? 1f - purpleBlend : purpleBlend;
+                object runeColor = CreateBlendedPulseColor(
+                    state,
+                    runeBlend,
+                    ConfiguredRuneBrightnessMultiplier);
+                if (portalColor != null && runeColor != null)
+                {
+                    if (state.TargetColorField != null)
+                    {
+                        // Valheim uses m_colorTargetfound for the model emission, which is
+                        // where the glowing frame symbols/runes are rendered.
+                        state.TargetColorField.SetValue(portal, runeColor);
+                    }
+                    foreach (ParticleVisualState particleState in state.Particles)
+                    {
+                        object mainModule = particleState.MainProperty.GetValue(
+                            particleState.Particle,
+                            null);
+                        object gradient = particleState.GradientConstructor.Invoke(new[] { portalColor });
+                        particleState.StartColorProperty.SetValue(mainModule, gradient, null);
+                    }
+                    if (state.Light != null && state.LightColorProperty != null)
+                    {
+                        state.LightColorProperty.SetValue(state.Light, portalColor, null);
+                    }
+                }
             }
-            object portalColor = CreateBlendedPulseColor(state, purpleBlend);
-            float runeBlend = ConfiguredInverseRunePulse ? 1f - purpleBlend : purpleBlend;
-            object runeColor = CreateBlendedPulseColor(
-                state,
-                runeBlend,
-                ConfiguredRuneBrightnessMultiplier);
-            if (portalColor == null || runeColor == null)
-            {
-                return;
-            }
-
-            if (state.TargetColorField != null)
-            {
-                // Valheim uses m_colorTargetfound for the model emission, which is
-                // where the glowing frame symbols/runes are rendered.
-                state.TargetColorField.SetValue(portal, runeColor);
-            }
-            foreach (ParticleVisualState particleState in state.Particles)
-            {
-                object mainModule = particleState.MainProperty.GetValue(particleState.Particle, null);
-                object gradient = particleState.GradientConstructor.Invoke(new[] { portalColor });
-                particleState.StartColorProperty.SetValue(mainModule, gradient, null);
-            }
-            if (state.Light != null && state.LightColorProperty != null)
-            {
-                state.LightColorProperty.SetValue(state.Light, portalColor, null);
-            }
-            ApplyPortalAudioPitch(state, purpleBlend);
+            ApplyPortalAudioPitch(portal, state, purpleBlend);
         }
 
-        private static void ApplyPortalAudioPitch(PortalVisualState state, float purpleBlend)
+        private static void ApplyPortalAudioPitch(
+            object portal,
+            PortalVisualState state,
+            float purpleBlend)
         {
+            if (!ConfiguredUnstableSound)
+            {
+                RestorePortalAudio(state);
+                return;
+            }
+
+            DateTime now = DateTime.UtcNow;
+            if (state.AudioSources.Count == 0 && now >= state.NextAudioCaptureUtc)
+            {
+                state.NextAudioCaptureUtc = now + AudioCaptureRetryInterval;
+                CapturePortalAudioSources(portal, state);
+                if (state.AudioSources.Count > 0 && state.AudioMissingDiagnosticLogged &&
+                    !state.AudioRecoveryLogged && _log != null)
+                {
+                    state.AudioRecoveryLogged = true;
+                    _log.LogDebug("A late-created portal audio source was discovered; pitch wobble resumed.");
+                }
+            }
+
             float minimum = Math.Min(ConfiguredMinimumPitchMultiplier, ConfiguredMaximumPitchMultiplier);
             float maximum = Math.Max(ConfiguredMinimumPitchMultiplier, ConfiguredMaximumPitchMultiplier);
-            float multiplier = ConfiguredUnstableSound
-                ? minimum + (maximum - minimum) * purpleBlend
-                : 1f;
+            float multiplier = minimum + (maximum - minimum) * purpleBlend;
 
-            foreach (AudioVisualState audioState in state.AudioSources)
+            for (int index = state.AudioSources.Count - 1; index >= 0; index--)
             {
+                AudioVisualState audioState = state.AudioSources[index];
                 try
                 {
                     audioState.PitchProperty.SetValue(
                         audioState.AudioSource,
                         audioState.OriginalPitch * multiplier,
                         null);
+                    state.AudioPitchModified = true;
                 }
                 catch
                 {
                     // Unity can destroy a child AudioSource before its portal wrapper is collected.
+                    state.AudioSources.RemoveAt(index);
                 }
+            }
+
+            if (state.AudioSources.Count == 0)
+            {
+                state.NextAudioCaptureUtc = now + AudioCaptureRetryInterval;
             }
         }
 
         private static void RestorePortalAudio(PortalVisualState state)
         {
+            if (!state.AudioPitchModified)
+            {
+                return;
+            }
+
             foreach (AudioVisualState audioState in state.AudioSources)
             {
                 try
@@ -618,6 +749,7 @@ namespace UnstablePortalsMetalTransport
                     // The portal or its audio child may already be shutting down.
                 }
             }
+            state.AudioPitchModified = false;
         }
 
         private static float GetPulseBlend(DateTime utcNow)
@@ -649,22 +781,16 @@ namespace UnstablePortalsMetalTransport
         {
             PortalVisualState state = new PortalVisualState();
             state.TargetColorField = FindField(portal.GetType(), "m_colorTargetfound");
-            if (state.TargetColorField == null)
+            if (state.TargetColorField != null)
             {
-                return state;
-            }
-
-            state.OriginalTargetColor = state.TargetColorField.GetValue(portal);
-            state.ColorConstructor = state.TargetColorField.FieldType.GetConstructor(
-                new[] { typeof(float), typeof(float), typeof(float), typeof(float) });
-            if (state.ColorConstructor == null)
-            {
-                return state;
+                state.OriginalTargetColor = state.TargetColorField.GetValue(portal);
+                state.ColorConstructor = state.TargetColorField.FieldType.GetConstructor(
+                    new[] { typeof(float), typeof(float), typeof(float), typeof(float) });
             }
 
             object effectFade = ReadField(portal, "m_target_found");
             IEnumerable particles = effectFade == null ? null : ReadField(effectFade, "m_particles") as IEnumerable;
-            if (particles != null)
+            if (particles != null && state.TargetColorField != null)
             {
                 foreach (object particle in particles)
                 {
@@ -720,8 +846,46 @@ namespace UnstablePortalsMetalTransport
             }
 
             CapturePortalAudioSources(portal, state);
+            state.NextAudioCaptureUtc = DateTime.UtcNow + AudioCaptureRetryInterval;
+            LogMissingPortalComponents(state);
 
             return state;
+        }
+
+        private static void LogMissingPortalComponents(PortalVisualState state)
+        {
+            if (state.DiagnosticsLogged)
+            {
+                return;
+            }
+            state.DiagnosticsLogged = true;
+
+            List<string> missing = new List<string>();
+            if (state.TargetColorField == null || state.ColorConstructor == null)
+            {
+                missing.Add("frame rune color");
+            }
+            if (state.Particles.Count == 0)
+            {
+                missing.Add("particle system");
+            }
+            if (state.Light == null || state.LightColorProperty == null)
+            {
+                missing.Add("portal light");
+            }
+            if (state.AudioSources.Count == 0)
+            {
+                missing.Add("audio source");
+                state.AudioMissingDiagnosticLogged = true;
+            }
+
+            if (missing.Count > 0 && _log != null)
+            {
+                _log.LogDebug(
+                    "Portal instability compatibility: could not find " +
+                    string.Join(", ", missing.ToArray()) +
+                    ". Available effects will continue; missing audio will be retried.");
+            }
         }
 
         private static void CapturePortalAudioSources(object portal, PortalVisualState state)
@@ -789,24 +953,30 @@ namespace UnstablePortalsMetalTransport
 
         internal static void RestorePortalVisuals()
         {
-            foreach (WeakReference reference in VisualPortals)
-            {
-                object portal = reference.Target;
-                if (portal == null)
-                {
-                    continue;
-                }
+            object[] portals = ActiveVisualPortals
+                .Select(reference => reference.Target)
+                .Where(portal => portal != null)
+                .ToArray();
+            ActiveVisualPortals.Clear();
 
+            foreach (object portal in portals)
+            {
                 try
                 {
-                    SetPortalTollEffect(portal, false);
+                    PortalVisualState state;
+                    if (!PortalVisualStates.TryGetValue(portal, out state))
+                    {
+                        continue;
+                    }
+                    state.ListedAsActive = false;
+                    state.TollEffectActive = false;
+                    RestorePortalState(portal, state);
                 }
                 catch
                 {
                     // A portal may be in the middle of being destroyed during shutdown.
                 }
             }
-            VisualPortals.Clear();
         }
 
         private static int ConfiguredCoreCost
@@ -855,6 +1025,48 @@ namespace UnstablePortalsMetalTransport
             {
                 return UnstablePortalsMetalTransportPlugin.DamageDestinationPortal == null ||
                        UnstablePortalsMetalTransportPlugin.DamageDestinationPortal.Value;
+            }
+        }
+
+        private static bool ConfiguredPreventSourcePortalDestruction
+        {
+            get
+            {
+                return UnstablePortalsMetalTransportPlugin.PreventSourcePortalDestruction != null &&
+                       UnstablePortalsMetalTransportPlugin.PreventSourcePortalDestruction.Value;
+            }
+        }
+
+        private static float ConfiguredPlayerDamageMaxHealthPercent
+        {
+            get
+            {
+                float value = UnstablePortalsMetalTransportPlugin.PlayerDamageMaxHealthPercent == null
+                    ? 0f
+                    : UnstablePortalsMetalTransportPlugin.PlayerDamageMaxHealthPercent.Value;
+                return Math.Max(0f, Math.Min(100f, value));
+            }
+        }
+
+        private static float ConfiguredPlayerDamageCurrentHealthPercent
+        {
+            get
+            {
+                float value = UnstablePortalsMetalTransportPlugin.PlayerDamageCurrentHealthPercent == null
+                    ? 0f
+                    : UnstablePortalsMetalTransportPlugin.PlayerDamageCurrentHealthPercent.Value;
+                return Math.Max(0f, Math.Min(100f, value));
+            }
+        }
+
+        private static float ConfiguredPlayerDamageFlat
+        {
+            get
+            {
+                float value = UnstablePortalsMetalTransportPlugin.PlayerDamageFlat == null
+                    ? 0f
+                    : UnstablePortalsMetalTransportPlugin.PlayerDamageFlat.Value;
+                return Math.Max(0f, Math.Min(10000f, value));
             }
         }
 
@@ -1087,22 +1299,10 @@ namespace UnstablePortalsMetalTransport
                     return true;
                 }
 
-                ConstructorInfo hitConstructor = _hitDataType.GetConstructor(new[] { typeof(float) });
-                object hit = hitConstructor == null
-                    ? Activator.CreateInstance(_hitDataType)
-                    : hitConstructor.Invoke(new object[] { damage });
-                if (hitConstructor == null)
+                object hit = CreateRawDamageHit(damage);
+                if (hit == null)
                 {
-                    object damageTypes = ReadField(hit, "m_damage");
-                    FieldInfo rawDamage = damageTypes == null
-                        ? null
-                        : FindField(damageTypes.GetType(), "m_damage");
-                    if (rawDamage == null)
-                    {
-                        return false;
-                    }
-                    rawDamage.SetValue(damageTypes, damage);
-                    FindField(hit.GetType(), "m_damage").SetValue(hit, damageTypes);
+                    return false;
                 }
 
                 SetHitPoint(hit, wearNTear);
@@ -1122,6 +1322,273 @@ namespace UnstablePortalsMetalTransport
             {
                 _log.LogWarning("Could not damage a toll portal: " + exception.Message);
                 return false;
+            }
+        }
+
+        private static bool WouldDestroySourcePortal(object sourcePortal)
+        {
+            if (!ConfiguredPreventSourcePortalDestruction || !ConfiguredDamageSource ||
+                ConfiguredDamagePercent <= 0f)
+            {
+                return false;
+            }
+
+            try
+            {
+                object wearNTear = FindComponent(sourcePortal, _wearNTearType);
+                float currentHealth;
+                float maximumHealth;
+                if (wearNTear == null ||
+                    !TryReadPortalHealth(wearNTear, out currentHealth, out maximumHealth))
+                {
+                    _log.LogDebug(
+                        "Source-portal destruction prevention could not read portal health; travel was not blocked.");
+                    return false;
+                }
+
+                float damage = maximumHealth * ConfiguredDamagePercent / 100f;
+                return damage > 0f && damage >= currentHealth;
+            }
+            catch (Exception exception)
+            {
+                _log.LogDebug(
+                    "Source-portal destruction prevention could not inspect the portal: " +
+                    exception.Message);
+                return false;
+            }
+        }
+
+        private static bool TryReadPortalHealth(
+            object wearNTear,
+            out float currentHealth,
+            out float maximumHealth)
+        {
+            currentHealth = 0f;
+            maximumHealth = 0f;
+
+            object maximumHealthValue = ReadField(wearNTear, "m_health");
+            if (maximumHealthValue == null)
+            {
+                return false;
+            }
+            maximumHealth = Convert.ToSingle(maximumHealthValue);
+            if (maximumHealth <= 0f)
+            {
+                return false;
+            }
+
+            if (TryInvokeFloatMethod(wearNTear, "GetHealth", out currentHealth))
+            {
+                return true;
+            }
+
+            float healthPercentage;
+            if (TryInvokeFloatMethod(wearNTear, "GetHealthPercentage", out healthPercentage))
+            {
+                currentHealth = maximumHealth * healthPercentage;
+                return true;
+            }
+
+            PropertyInfo currentHealthProperty = wearNTear.GetType().GetProperty(
+                "CurrentHealth", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (currentHealthProperty != null && currentHealthProperty.CanRead)
+            {
+                currentHealth = Convert.ToSingle(currentHealthProperty.GetValue(wearNTear, null));
+                return true;
+            }
+
+            FieldInfo currentHealthField = FindField(wearNTear.GetType(), "CurrentHealth");
+            if (currentHealthField != null)
+            {
+                currentHealth = Convert.ToSingle(currentHealthField.GetValue(wearNTear));
+                return true;
+            }
+
+            return TryReadWearNTearZdoHealth(wearNTear, maximumHealth, out currentHealth);
+        }
+
+        private static bool TryReadWearNTearZdoHealth(
+            object wearNTear,
+            float maximumHealth,
+            out float currentHealth)
+        {
+            currentHealth = 0f;
+            object nview = ReadField(wearNTear, "m_nview");
+            if (nview == null)
+            {
+                return false;
+            }
+
+            MethodInfo getZdo = nview.GetType().GetMethod(
+                "GetZDO", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                null, Type.EmptyTypes, null);
+            object zdo = getZdo == null ? null : getZdo.Invoke(nview, null);
+            if (zdo == null)
+            {
+                return false;
+            }
+
+            Type zdoVarsType = AccessTools.TypeByName("ZDOVars");
+            FieldInfo healthHashField = zdoVarsType == null
+                ? null
+                : zdoVarsType.GetField(
+                    "s_health", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            object healthKey = healthHashField == null ? null : healthHashField.GetValue(null);
+
+            MethodInfo getFloat = zdo.GetType()
+                .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                .FirstOrDefault(method =>
+                {
+                    ParameterInfo[] parameters = method.GetParameters();
+                    return method.Name == "GetFloat" && parameters.Length == 2 &&
+                           parameters[1].ParameterType == typeof(float) &&
+                           ((healthKey != null && parameters[0].ParameterType.IsInstanceOfType(healthKey)) ||
+                            parameters[0].ParameterType == typeof(string));
+                });
+            if (getFloat == null)
+            {
+                return false;
+            }
+
+            object key = getFloat.GetParameters()[0].ParameterType == typeof(string)
+                ? (object)"health"
+                : healthKey;
+            if (key == null)
+            {
+                return false;
+            }
+
+            currentHealth = Convert.ToSingle(getFloat.Invoke(zdo, new[] { key, (object)maximumHealth }));
+            return true;
+        }
+
+        private static void ApplyPlayerDamage(object player)
+        {
+            float maxHealthPercent = ConfiguredPlayerDamageMaxHealthPercent;
+            float currentHealthPercent = ConfiguredPlayerDamageCurrentHealthPercent;
+            float flatDamage = ConfiguredPlayerDamageFlat;
+            if (maxHealthPercent <= 0f && currentHealthPercent <= 0f && flatDamage <= 0f)
+            {
+                return;
+            }
+
+            try
+            {
+                float currentHealth;
+                float maximumHealth;
+                if (!TryInvokeFloatMethod(player, "GetHealth", out currentHealth) ||
+                    !TryInvokeFloatMethod(player, "GetMaxHealth", out maximumHealth))
+                {
+                    _log.LogWarning("Could not read player health, so portal player damage was not applied.");
+                    return;
+                }
+
+                float damage = maximumHealth * maxHealthPercent / 100f +
+                               currentHealth * currentHealthPercent / 100f +
+                               flatDamage;
+                if (damage <= 0f)
+                {
+                    return;
+                }
+
+                object hit = CreateRawDamageHit(damage);
+                if (hit == null)
+                {
+                    _log.LogWarning("Could not create player portal damage data.");
+                    return;
+                }
+
+                SetHitPoint(hit, player);
+                SetBoolFieldIfPresent(hit, "m_blockable", false);
+                SetBoolFieldIfPresent(hit, "m_dodgeable", false);
+                SetBoolFieldIfPresent(hit, "m_ignorePVP", true);
+
+                MethodInfo damageMethod = player.GetType().GetMethod(
+                    "Damage", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                    null, new[] { _hitDataType }, null);
+                if (damageMethod == null)
+                {
+                    _log.LogWarning("Could not find the player damage method.");
+                    return;
+                }
+
+                damageMethod.Invoke(player, new[] { hit });
+                _log.LogInfo(
+                    "Applied " + damage.ToString("0.##") +
+                    " configured player damage after restricted-item portal travel.");
+            }
+            catch (Exception exception)
+            {
+                _log.LogWarning("Could not damage the player after portal travel: " + exception.Message);
+            }
+        }
+
+        private static object CreateRawDamageHit(float damage)
+        {
+            if (_hitDataType == null)
+            {
+                return null;
+            }
+
+            ConstructorInfo hitConstructor = _hitDataType.GetConstructor(new[] { typeof(float) });
+            object hit = hitConstructor == null
+                ? Activator.CreateInstance(_hitDataType)
+                : hitConstructor.Invoke(new object[] { damage });
+            if (hitConstructor != null)
+            {
+                return hit;
+            }
+
+            object damageTypes = ReadField(hit, "m_damage");
+            FieldInfo rawDamage = damageTypes == null
+                ? null
+                : FindField(damageTypes.GetType(), "m_damage");
+            FieldInfo hitDamage = FindField(hit.GetType(), "m_damage");
+            if (rawDamage == null || hitDamage == null)
+            {
+                return null;
+            }
+
+            rawDamage.SetValue(damageTypes, damage);
+            hitDamage.SetValue(hit, damageTypes);
+            return hit;
+        }
+
+        private static bool TryInvokeFloatMethod(object instance, string methodName, out float value)
+        {
+            value = 0f;
+            if (instance == null)
+            {
+                return false;
+            }
+
+            MethodInfo method = instance.GetType().GetMethod(
+                methodName,
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                null,
+                Type.EmptyTypes,
+                null);
+            if (method == null)
+            {
+                return false;
+            }
+
+            object result = method.Invoke(instance, null);
+            if (result == null)
+            {
+                return false;
+            }
+
+            value = Convert.ToSingle(result);
+            return true;
+        }
+
+        private static void SetBoolFieldIfPresent(object instance, string fieldName, bool value)
+        {
+            FieldInfo field = FindField(instance.GetType(), fieldName);
+            if (field != null && field.FieldType == typeof(bool))
+            {
+                field.SetValue(instance, value);
             }
         }
 
