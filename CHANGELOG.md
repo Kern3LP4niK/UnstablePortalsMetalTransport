@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.3.0
+
+- Adds optional player damage after a successful paid trip: percentage of maximum HP, percentage of current HP, and flat HP.
+- Calculates all enabled player-damage components from one pre-damage health snapshot and applies their sum through Valheim's normal player damage method.
+- Defaults every player-damage component to `0`, preserving the previous behavior after an upgrade.
+- Adds disabled-by-default source-portal destruction prevention. When enabled, travel is rejected before payment if the configured source damage would destroy the entry portal.
+- Keeps destination damage outside the destruction-prevention check because a remote destination portal may not be loaded before travel.
+- Adds the project GitHub page to package metadata and the README for source access, issue reports, and feedback.
+
+## 1.2.3
+
+- Retries audio-source discovery for active portals whose sound components are created after the portal is first captured.
+- Restores altered pitch once when unstable audio is disabled, then stops writing pitch values so other audio mods remain in control.
+- Restricts the per-frame animation loop to currently unstable portals instead of every portal previously encountered.
+- Adds one-time debug diagnostics for missing frame-rune color, particle, light, and audio components.
+- Safely removes destroyed portals and failed visual wrappers from the active animation list.
+- Expands regression coverage for late audio, disabled audio, inactive portals, pitch restoration, and destroyed portals.
+
 ## 1.2.2
 
 - Completes the rename by changing the plugin GUID to `com.kernelpanik.unstableportalsmetaltransport`.

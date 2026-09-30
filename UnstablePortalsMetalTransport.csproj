@@ -4,7 +4,7 @@
     <LangVersion>latest</LangVersion>
     <AssemblyName>UnstablePortalsMetalTransport</AssemblyName>
     <RootNamespace>UnstablePortalsMetalTransport</RootNamespace>
-    <Version>1.2.2</Version>
+    <Version>1.3.0</Version>
     <Authors>KernelPanik</Authors>
     <Company>KernelPanik</Company>
     <Nullable>disable</Nullable>
